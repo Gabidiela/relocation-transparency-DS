@@ -51,7 +51,7 @@ func reload() error {
 }
 
 func main() {
-    addr := flag.String("addr", ":7000", "endereço TCP do proxy")
+    addr := flag.String("addr", ":8000", "endereço TCP do proxy")
     flag.StringVar(&routesFn, "routes", "./routes.json", "arquivo de rotas JSON")
     flag.Parse()
 
@@ -125,7 +125,7 @@ func main() {
     }()
 
 
-    ln, err := net.Listen("tcp", *addr)
+    ln, err := net.Listen("tcp4", *addr)
     if err != nil { panic(err) }
     fmt.Println("proxy escutando em", *addr, "routes=", routesFn)
 

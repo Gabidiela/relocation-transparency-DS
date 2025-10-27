@@ -1,123 +1,153 @@
 #!/usr/bin/env bash
+# Migração A -> B com validação + troca de rota no Proxy
+# Requisitos: ssh com chave, rsync, jq, nc
+# Uso típico (com defaults abaixo):
+#   ./migrate.sh \
+#     --src-host 10.0.0.10 --src-user usuario --src-path /srv/filesA/grande.txt \
+#     --dst-host 10.0.0.11 --dst-user usuario --dst-path /srv/filesB/grande.txt \
+#     --proxy-host 10.0.0.10 --proxy-user usuario \
+#     --routes /home/usuario/sd/routes.json \
+#     --name grande.txt --backend-host 10.0.0.11 --backend-port 3001 \
+#     --reload fsnotify
+
 set -euo pipefail
 
-# Uso:
-#  Local (rodando NO host do proxy; routes.json local):
-#    scripts/migrate.sh \
-#      --src user@A:/srv/filesA/big.bin \
-#      --dst user@B:/srv/filesB/big.bin \
-#      --routes /home/ec2-user/reloc/routes.json \
-#      --name big.bin \
-#      --backend 10.0.0.11:3001 \
-#      --reload fsnotify        # ou sighup / none
-#
-#  Remoto (rodando de outra máquina; atualiza routes.json via SSH no host do proxy):
-#    scripts/migrate.sh \
-#      --src user@A:/srv/filesA/big.bin \
-#      --dst user@B:/srv/filesB/big.bin \
-#      --routes /home/ec2-user/reloc/routes.json \
-#      --name big.bin \
-#      --backend 10.0.0.11:3001 \
-#      --proxy-host ec2-user@10.0.0.10 \
-#      --reload sighup          # se não tiver auto-reload
-#
-# Flags:
-#   --src         Caminho origem (local ou user@host:/path)
-#   --dst         Caminho destino (local ou user@host:/path)
-#   --routes      Caminho do routes.json no host do proxy
-#   --name        Nome lógico do arquivo (chave no routes.json)
-#   --backend     Novo backend "host:porta" (ex.: 10.0.0.11:3001)
-#   --proxy-host  (opcional) user@host do PROXY para atualizar o routes.json via SSH
-#   --reload      (opcional) fsnotify|sighup|none  (default: fsnotify)
-#   --proxy-pid   (opcional) PID do tcp_proxy (para sighup quando --proxy-host estiver vazio)
+# ===================== defaults (ajuste se quiser) =====================
+SRC_HOST="${SRC_HOST:-10.0.0.10}"       # M1 (FileServer A)
+SRC_USER="${SRC_USER:-usuario}"
+SRC_PATH="${SRC_PATH:-/srv/filesA/grande.txt}"
 
-SRC=""; DST=""; ROUTES=""; NAME=""; BACKEND=""
-PROXY_HOST=""; RELOAD="fsnotify"; PROXY_PID=""
+DST_HOST="${DST_HOST:-10.0.0.11}"       # M2 (FileServer B)
+DST_USER="${DST_USER:-usuario}"
+DST_PATH="${DST_PATH:-/srv/filesB/grande.txt}"
 
+PROXY_HOST="${PROXY_HOST:-10.0.0.10}"   # M1 (Proxy)
+PROXY_USER="${PROXY_USER:-usuario}"
+ROUTES="${ROUTES:-/home/usuario/sd/routes.json}"
+
+NAME="${NAME:-grande.txt}"              # nome lógico solicitado pelo cliente
+BACKEND_HOST="${BACKEND_HOST:-10.0.0.11}"
+BACKEND_PORT="${BACKEND_PORT:-3001}"
+RELOAD="${RELOAD:-fsnotify}"            # fsnotify | sighup | none
+# ======================================================================
+
+print_usage() {
+  sed -n '1,120p' "$0" | sed -n '1,60p' | sed 's/^# \{0,1\}//'
+  echo ""
+  echo "Flags disponíveis:"
+  cat <<'EOF'
+  --src-host HOST           IP/host do servidor A
+  --src-user USER           usuário SSH do A
+  --src-path PATH           caminho absoluto do arquivo em A
+  --dst-host HOST           IP/host do servidor B
+  --dst-user USER           usuário SSH do B
+  --dst-path PATH           caminho absoluto do arquivo em B
+  --proxy-host HOST         IP/host do Proxy (onde está o routes.json)
+  --proxy-user USER         usuário SSH do Proxy
+  --routes PATH             caminho do routes.json no Proxy
+  --name NAME               nome lógico do arquivo (chave no routes.json)
+  --backend-host HOST       host do novo backend (B)
+  --backend-port PORT       porta do novo backend (ex.: 3001)
+  --reload fsnotify|sighup|none  estratégia de reload no Proxy
+  -h | --help               mostra esta ajuda
+EOF
+}
+
+# ---- parse flags ----
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --src) SRC="$2"; shift 2;;
-    --dst) DST="$2"; shift 2;;
+    --src-host) SRC_HOST="$2"; shift 2;;
+    --src-user) SRC_USER="$2"; shift 2;;
+    --src-path) SRC_PATH="$2"; shift 2;;
+    --dst-host) DST_HOST="$2"; shift 2;;
+    --dst-user) DST_USER="$2"; shift 2;;
+    --dst-path) DST_PATH="$2"; shift 2;;
+    --proxy-host) PROXY_HOST="$2"; shift 2;;
+    --proxy-user) PROXY_USER="$2"; shift 2;;
     --routes) ROUTES="$2"; shift 2;;
     --name) NAME="$2"; shift 2;;
-    --backend) BACKEND="$2"; shift 2;;
-    --proxy-host) PROXY_HOST="$2"; shift 2;;
+    --backend-host) BACKEND_HOST="$2"; shift 2;;
+    --backend-port) BACKEND_PORT="$2"; shift 2;;
     --reload) RELOAD="$2"; shift 2;;
-    --proxy-pid) PROXY_PID="$2"; shift 2;;
-    -h|--help) sed -n '1,120p' "$0"; exit 0;;
-    *) echo "arg desconhecido: $1"; exit 1;;
+    -h|--help) print_usage; exit 0;;
+    *) echo "Argumento inválido: $1"; print_usage; exit 1;;
   esac
 done
 
-[[ -z "$SRC" || -z "$DST" || -z "$ROUTES" || -z "$NAME" || -z "$BACKEND" ]] && {
-  echo "Erro: faltam parâmetros obrigatórios. Use --help."; exit 1; }
+BACKEND="${BACKEND_HOST}:${BACKEND_PORT}"
 
-echo "[migrate] copiando: $SRC -> $DST"
-if command -v rsync >/dev/null 2>&1; then
-  rsync -av --progress "$SRC" "$DST" || { echo "[migrate] rsync falhou, tentando scp..."; scp "$SRC" "$DST"; }
-else
-  echo "[migrate] rsync não encontrado, usando scp"; scp "$SRC" "$DST"
+log() { printf '[migrate] %s\n' "$*"; }
+die() { printf '[migrate] ERRO: %s\n' "$*" >&2; exit 1; }
+
+need_local_bin() {
+  command -v "$1" >/dev/null 2>&1 || die "comando local não encontrado: $1"
+}
+
+# ---- pré-checks locais ----
+need_local_bin ssh
+need_local_bin rsync
+need_local_bin jq
+need_local_bin nc
+
+# ---- helpers ----
+ssh_a() { ssh -o StrictHostKeyChecking=no "${SRC_USER}@${SRC_HOST}" "$@"; }
+ssh_b() { ssh -o StrictHostKeyChecking=no "${DST_USER}@${DST_HOST}" "$@"; }
+ssh_p() { ssh -o StrictHostKeyChecking=no "${PROXY_USER}@${PROXY_HOST}" "$@"; }
+
+# ===================== 1) checagens de conectividade ===================
+log "checando conectividade SSH..."
+ssh_a 'echo OK_A' >/dev/null || die "não conectou em A (${SRC_HOST})"
+ssh_b 'echo OK_B' >/dev/null || die "não conectou em B (${DST_HOST})"
+ssh_p 'echo OK_PROXY' >/dev/null || die "não conectou no Proxy (${PROXY_HOST})"
+
+# ===================== 2) valida origem e destinos =====================
+log "validando arquivo de origem em A: ${SRC_PATH}"
+SRC_SIZE="$(ssh_a "stat -c %s '${SRC_PATH}'" 2>/dev/null || true)"
+[[ -n "${SRC_SIZE}" && "${SRC_SIZE}" -gt 0 ]] || die "arquivo de origem não existe ou tem tamanho 0"
+
+log "garantindo diretório de destino em B: $(dirname "${DST_PATH}")"
+ssh_b "mkdir -p '$(dirname "${DST_PATH}")'"
+
+# ===================== 3) copia A -> B (rsync via SSH) =================
+log "copiando de A (${SRC_HOST}) para B (${DST_HOST})..."
+rsync -av --progress -e 'ssh -o StrictHostKeyChecking=no' \
+  "${SRC_USER}@${SRC_HOST}:${SRC_PATH}" \
+  "${DST_USER}@${DST_HOST}:${DST_PATH}"
+
+# ===================== 4) valida cópia no B ============================
+DST_SIZE="$(ssh_b "stat -c %s '${DST_PATH}'")" || die "não consegui obter tamanho no B"
+[[ "${DST_SIZE}" == "${SRC_SIZE}" ]] || die "tamanho difere (A=${SRC_SIZE}, B=${DST_SIZE})"
+
+log "cópia validada com sucesso (${DST_SIZE} bytes)."
+
+# ===================== 5) smoke test no FileServer B ===================
+# Testa se o FileServer B (porta 3001 por padrão) responde DATA para NAME
+log "testando fileserver B em ${BACKEND} para '${NAME}'..."
+if ! printf 'GET %s 0\r\n' "${NAME}" | nc -w 3 -v "${BACKEND_HOST}" "${BACKEND_PORT}" | head -n1 | grep -q '^DATA '; then
+  die "fileserver B não respondeu 'DATA' (verifique se o arquivo '${NAME}' existe em --base do B e os serviços estão de pé)"
 fi
 
-update_routes_local() {
-  local routes="$1" name="$2" backend="$3"
-  [[ -f "$routes" ]] || { echo "[migrate] routes.json não encontrado em $routes"; exit 1; }
-  command -v jq >/dev/null 2>&1 || { echo "[migrate] jq é necessário"; exit 1; }
-  local tmp
-  tmp="$(mktemp)"
-  # Atualização atômica: grava em tmp e mv por cima (bom para fsnotify)
-  jq --arg k "$name" --arg v "$backend" '.[$k]=$v' "$routes" > "$tmp"
-  mv "$tmp" "$routes"
-  echo "[migrate] routes.json atualizado localmente: $name -> $backend"
-}
+# ===================== 6) atualiza routes.json no Proxy =================
+log "atualizando routes.json no Proxy (${ROUTES}) => ${NAME} -> ${BACKEND}"
+ssh_p "test -f '${ROUTES}' || { echo 'routes.json inexistente em ${ROUTES}' >&2; exit 1; }"
+ssh_p "tmp=\$(mktemp) && jq --arg k '${NAME}' --arg v '${BACKEND}' '.[\$k]=\$v' '${ROUTES}' > \"\$tmp\" && mv \"\$tmp\" '${ROUTES}'" \
+  || die "falha ao atualizar routes.json no Proxy"
 
-update_routes_remote() {
-  local proxy="$1" routes="$2" name="$3" backend="$4"
-  # Faz a edição no host remoto usando jq
-  ssh -o BatchMode=yes "$proxy" "command -v jq >/dev/null 2>&1 || sudo dnf -y install jq || sudo yum -y install jq"
-  ssh "$proxy" "test -f '$routes' || { echo 'routes.json não existe em $routes' >&2; exit 1; }"
-  ssh "$proxy" "tmp=\$(mktemp) && jq --arg k '$name' --arg v '$backend' '.[\$k]=\$v' '$routes' > \$tmp && mv \$tmp '$routes'"
-  echo "[migrate] routes.json atualizado no proxy ($proxy): $name -> $backend"
-}
-
-reload_proxy_sighup_local() {
-  local pid="$1"
-  if [[ -z "$pid" ]]; then
-    pid="$(pgrep -f tcp_proxy || true)"
-  fi
-  [[ -n "$pid" ]] || { echo "[migrate] não encontrei tcp_proxy local"; return 1; }
-  kill -HUP "$pid" && echo "[migrate] SIGHUP enviado ao tcp_proxy (PID=$pid)"
-}
-
-reload_proxy_sighup_remote() {
-  local proxy="$1"
-  ssh "$proxy" 'pid=$(pgrep -f tcp_proxy || true); if [ -n "$pid" ]; then kill -HUP "$pid"; echo "SIGHUP enviado ao tcp_proxy (PID=$pid)"; else echo "tcp_proxy não encontrado"; fi'
-}
-
-# Atualiza rotas (local ou via SSH)
-if [[ -n "$PROXY_HOST" ]]; then
-  update_routes_remote "$PROXY_HOST" "$ROUTES" "$NAME" "$BACKEND"
-else
-  update_routes_local "$ROUTES" "$NAME" "$BACKEND"
-fi
-
-# Estratégia de reload
-case "$RELOAD" in
+# ===================== 7) reload do Proxy ==============================
+case "${RELOAD}" in
   fsnotify)
-    echo "[migrate] usando fsnotify: salvar o arquivo já acionou o reload no proxy."
+    log "fsnotify habilitado: salvar o arquivo já disparou o reload no proxy."
     ;;
   sighup)
-    if [[ -n "$PROXY_HOST" ]]; then
-      reload_proxy_sighup_remote "$PROXY_HOST"
-    else
-      reload_proxy_sighup_local "$PROXY_PID"
-    fi
+    log "enviando SIGHUP ao tcp_proxy no Proxy..."
+    ssh_p 'pid=$(pgrep -f tcp_proxy || true); if [ -n "$pid" ]; then kill -HUP "$pid"; echo "SIGHUP enviado (PID=$pid)"; else echo "tcp_proxy não encontrado"; fi'
     ;;
   none)
-    echo "[migrate] sem reload automático solicitado (--reload=none)."
+    log "reload desativado (--reload=none). Atualize manualmente se necessário."
     ;;
   *)
-    echo "[migrate] valor inválido para --reload: $RELOAD"; exit 1;;
+    die "valor inválido para --reload: ${RELOAD}"
+    ;;
 esac
 
-echo "[migrate] migração concluída."
+log "rota trocada para ${BACKEND}. Migração concluída com sucesso."

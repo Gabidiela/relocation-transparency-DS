@@ -16,13 +16,13 @@ import (
 
 func main() {
     throttleKB := flag.Int("throttle-kbps", 0, "limite de envio em KB/s (0 = sem limite)")
-    addr := flag.String("addr", ":5000", "endereço TCP para escutar")
+    addr := flag.String("addr", ":8000", "endereço TCP para escutar")
     base := flag.String("base", "/srv/files", "diretório base dos arquivos")
     flag.Parse()
 
     if err := os.MkdirAll(*base, 0o755); err != nil { panic(err) }
 
-    ln, err := net.Listen("tcp", *addr)
+    ln, err := net.Listen("tcp4", *addr)
     if err != nil { panic(err) }
     fmt.Println("fileserver escutando em", *addr, "base=", *base)
 
