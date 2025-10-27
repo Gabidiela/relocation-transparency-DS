@@ -244,7 +244,7 @@ func handleClient(cli net.Conn) {
 
 
 func copyN(w *bufio.Writer, r *bufio.Reader, n int64) error {
-    buf := make([]byte, 256*1024)
+    buf := make([]byte, 64*1024)
     var left = n
     for left > 0 {
         chunk := int64(len(buf))

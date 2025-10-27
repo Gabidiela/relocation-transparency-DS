@@ -58,7 +58,7 @@ func handleConn(c net.Conn, base string, throttleKB int) {
 
     if _, err := f.Seek(off, io.SeekStart); err != nil { fmt.Fprint(w, "ERR seek\r\n"); _ = w.Flush(); return }
 
-    buf := make([]byte, 256*1024)
+    buf := make([]byte, 64*1024)
     for {
         n, er := f.Read(buf)
         if n > 0 {
