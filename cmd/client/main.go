@@ -1,103 +1,148 @@
-// cmd/tcp_client/main.go (versão verbosa)
 package main
 
 import (
 	"bufio"
 	"flag"
 	"fmt"
+	"io"
 	"net"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 )
 
+var (
+	proxyAddr = flag.String("proxy", "127.0.0.1:8000", "endereço do proxy")
+	name      = flag.String("name", "grande.txt", "nome lógico do arquivo")
+	out       = flag.String("out", "grande.txt", "arquivo de saída")
+	retryWait = flag.Duration("retry-wait", 2*time.Second, "tempo de espera entre tentativas")
+)
+
 func main() {
-	proxy := flag.String("proxy", "127.0.0.1:8000", "endereço do proxy/fileserver TCP")
-	name := flag.String("name", "example.txt", "nome do arquivo")
-	out := flag.String("out", "example.txt", "arquivo de saída")
 	flag.Parse()
 
 	part := *out + ".part"
-	var offset int64 = 0
-	if st, err := os.Stat(part); err == nil { offset = st.Size() }
-
-	f, err := os.OpenFile(part, os.O_CREATE|os.O_WRONLY, 0o644)
-	if err != nil { panic(err) }
-	if _, err := f.Seek(offset, 0); err != nil { panic(err) }
-
-	c, err := net.Dial("tcp", *proxy)
-	if err != nil { panic(err) }
-	defer c.Close()
-	r := bufio.NewReader(c)
-
-	// envia pedido
-	fmt.Fprintf(c, "GET %s %d\n", *name, offset)
-
-	var written int64 = 0
-	seenEOF := false
-
-	for {
-		// evita travar para sempre se o servidor morrer sem mandar EOF
-		_ = c.SetReadDeadline(time.Now().Add(10 * time.Second))
-
-		hdr, err := r.ReadString('\n')
-		if err != nil {
-			fmt.Println("ERRO lendo header:", err)
-			break
-		}
-		hdr = strings.TrimSpace(hdr)
-		fmt.Println("HDR:", hdr)
-
-		if hdr == "EOF" {
-			seenEOF = true
-			break
-		}
-		if !strings.HasPrefix(hdr, "DATA ") {
-			fmt.Println("Cabeçalho inesperado do servidor:", hdr)
-			break
-		}
-		nStr := strings.TrimPrefix(hdr, "DATA ")
-		n, err := strconv.ParseInt(nStr, 10, 64)
-		if err != nil || n < 0 {
-			fmt.Println("DATA inválido:", nStr)
-			break
-		}
-
-		if err := recvToFile(r, f, n); err != nil {
-			fmt.Println("erro ao receber bloco:", err)
-			break
-		}
-		offset += n
-		written += n
-		fmt.Printf("... +%d bytes (total=%d)\n", n, offset)
+	if err := os.MkdirAll(filepath.Dir(part), 0o755); err != nil && !os.IsExist(err) {
+		// se for o diretório atual, tudo bem
 	}
 
-	_ = f.Close()
+	// abre .part em append para calcular offset e continuar
+	f, err := os.OpenFile(part, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		fmt.Println("ERRO abrindo .part:", err)
+		os.Exit(1)
+	}
+	defer f.Close()
 
-	if seenEOF && written > 0 {
-		if err := os.Rename(part, *out); err == nil {
+	// calcula offset inicial
+	offset, err := fileSize(part)
+	if err != nil {
+		fmt.Println("ERRO lendo tamanho:", err)
+		os.Exit(1)
+	}
+	fmt.Println("offset inicial:", offset)
+
+	for {
+		err = downloadOnce(*proxyAddr, *name, f, &offset)
+		if err == nil {
+			// renomeia .part -> final
+			_ = f.Close()
+			if err := os.Rename(part, *out); err != nil {
+				fmt.Println("ERRO ao renomear:", err)
+				os.Exit(1)
+			}
 			fmt.Println("OK: download concluído e renomeado.")
-		} else {
-			fmt.Println("Baixado, mas falhou ao renomear:", err)
+			return
 		}
-	} else {
-		fmt.Println("ATENÇÃO: sem EOF ou 0 bytes recebidos — .part preservado para debug.")
+		fmt.Println("WARN:", err, " — tentando de novo após", *retryWait)
+		time.Sleep(*retryWait)
+		// reabre o arquivo em append (caso a conexão tenha fechado e o handle se perca)
+		f, _ = os.OpenFile(part, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 	}
 }
 
-func recvToFile(r *bufio.Reader, f *os.File, n int64) error {
-	buf := make([]byte, 64*1024)
-	left := n
-	for left > 0 {
-		chunk := int64(len(buf))
-		if chunk > left { chunk = left }
-		m, err := r.Read(buf[:chunk])
-		if m > 0 {
-			if _, e2 := f.Write(buf[:m]); e2 != nil { return e2 }
-			left -= int64(m)
+func downloadOnce(proxy, name string, dst *os.File, offset *int64) error {
+	conn, err := net.Dial("tcp4", proxy)
+	if err != nil {
+		return fmt.Errorf("dial proxy: %w", err)
+	}
+	defer conn.Close()
+
+	// envia GET <name> <offset>\r\n
+	fmt.Fprintf(conn, "GET %s %d\r\n", name, *offset)
+
+	r := bufio.NewReader(conn)
+	for {
+		h, err := r.ReadString('\n')
+		if err != nil {
+			return fmt.Errorf("ler header: %w", err)
 		}
-		if err != nil { return err }
+		h = strings.TrimSpace(h)
+
+		if strings.HasPrefix(h, "SRV ") {
+			backend := strings.TrimSpace(strings.TrimPrefix(h, "SRV"))
+			fmt.Println("BACKEND:", backend)
+			continue
+		}
+
+		if strings.HasPrefix(h, "DATA ") {
+			nStr := strings.TrimSpace(strings.TrimPrefix(h, "DATA"))
+			n, perr := strconv.ParseInt(nStr, 10, 64)
+			if perr != nil || n < 0 {
+				return fmt.Errorf("DATA inválido: %s", h)
+			}
+			if n == 0 {
+				continue
+			}
+			if err := copyN(dst, r, n); err != nil {
+				return fmt.Errorf("copiando payload: %w", err)
+			}
+			*offset += n
+			fmt.Printf("... +%d bytes (total=%d)\n", n, *offset)
+			continue
+		}
+
+		if h == "EOF" {
+			return nil
+		}
+		if strings.HasPrefix(h, "ERR ") {
+			return fmt.Errorf("servidor: %s", h)
+		}
+		// header inesperado — loga e segue
+		fmt.Println("HDR desconhecido:", h)
+	}
+}
+
+func copyN(dst *os.File, r io.Reader, n int64) error {
+	// copia exatamente n bytes do reader para o arquivo
+	remaining := n
+	buf := make([]byte, 64*1024)
+	for remaining > 0 {
+		toRead := int64(len(buf))
+		if remaining < toRead {
+			toRead = remaining
+		}
+		m, err := io.ReadFull(r, buf[:toRead])
+		if err != nil {
+			return err
+		}
+		if _, err := dst.Write(buf[:m]); err != nil {
+			return err
+		}
+		remaining -= int64(m)
 	}
 	return nil
+}
+
+func fileSize(path string) (int64, error) {
+	st, err := os.Stat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0, nil
+		}
+		return 0, err
+	}
+	return st.Size(), nil
 }
